@@ -51,7 +51,6 @@ const props = defineProps({
   },
 });
 const scrollTop = ref(0);
-const scrollBottom = ref(0);
 const startIndex = ref(0);
 const visibleCount = computed(() =>
   Math.ceil(props.AllHeight / props.itemHeight)

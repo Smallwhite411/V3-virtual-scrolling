@@ -30,10 +30,24 @@
       <div>{{ index }},{{ item.text }}</div>
     </template>
   </TextVirtal>
-  <div class="title-style">自己尝试写不固定高度虚拟列表(不固定高度的高度指的是item的高度)</div>
-  <TextVaribleHeightVirtual :data="listData" :itemHeight="50" :AllHeight="200">
-    <template #default="{ item, index }">
-      <div>{{ index }},{{ item.text }}</div>
+  <div class="title-style">
+    自己尝试写不固定高度虚拟列表(不固定高度的高度指的是item的高度)
+  </div>
+  <TextVaribleHeightVirtual
+    :allItems="allItems"
+    :itemHeight="50"
+    :AllHeight="200"
+    keyField="id"
+  >
+    <template #default="{ item }">
+      <div
+        :style="{
+          display: 'flex',
+          alignItems: 'center',
+        }"
+      >
+        {{ item.text }}
+      </div>
     </template>
   </TextVaribleHeightVirtual>
   <div class="title-style">可变高度 + 无限滚动虚拟列表</div>
@@ -46,7 +60,10 @@
     <template #default="{ item, index }">
       <div
         :data-index="index"
-        :style="{ padding: '10px', borderBottom: '1px solid #ccc' }"
+        :style="{
+          padding: '10px',
+          borderBottom: '1px solid #ccc',
+        }"
       >
         {{ index }} - {{ item }}
       </div>
@@ -60,14 +77,16 @@ import OptFixedHeightVirtualScroll from "./components/OptFixedHeightVirtual/inde
 import VariableHeightVirtual from "./components/VariableHeightVirtual/index.vue";
 import TextVaribleHeightVirtual from "./components/TextVaribleHeightVirtual/index.vue";
 import { ref } from "vue";
-interface Item {
+export interface Item {
   id: number;
   text: string;
+  height: number;
 }
 
 const listData: Item[] = Array.from({ length: 10000 }, (_, i) => ({
   id: i,
   text: `Item ${i}`,
+  height: Math.floor(Math.random() * 100) + 50,
 }));
 
 const listRef = ref<InstanceType<typeof OptFixedHeightVirtualScroll> | null>(
@@ -82,6 +101,12 @@ const items = ref(
     text: "Item " + i + " " + "x".repeat(Math.floor(Math.random() * 20)),
   }))
 );
+const allItems = Array.from({ length: 100 }, (v, i) => {
+  return {
+    id: i,
+    text: "Itemdddd " + i + " " + "x".repeat(Math.floor(Math.random() * 20)),
+  };
+});
 </script>
 <style lang="scss">
 #app {

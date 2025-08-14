@@ -1,36 +1,29 @@
 <template>
   <div
-    ref="scrollContainer"
-    class="text-viral"
-    :style="{ height: AllHeight + 'px', overflowY: 'auto' }"
-    @scroll.passive="onScroll"
+    ref="viewportRef"
+    :style="{ height: AllHeight + 'px' }"
+    class="viewport"
+    @scroll="handleScroll"
   >
-    <div :style="{ paddingTop: paddingTop + 'px' }"></div>
-    <div
-      v-for="(item, index) in currentData"
-      :style="{ height: itemHeight + 'px' }"
-      :key="getKey(item, startIndex + index)"
-      class="text-list-item"
-    >
-      <slot :item="item" :index="startIndex + index"></slot>
+    <div class="content-placeholder"></div>
+    <div class="content-wrap" :style="{ transform: `translateY(${offset}px)` }">
+      <div
+        v-for="item in renderItems"
+        :ref="(el) => renderItemsRef(el, item[props.keyField])"
+        :key="item[props.keyField]"
+        class="content-item"
+      >
+        <slot :item="item" />
+      </div>
     </div>
-    <div :style="{ paddingBottom: paddingBottom + 'px' }"></div>
   </div>
 </template>
 
-<script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
-interface Item {
-  id: number;
-  text: string;
-}
-interface DefaultItem {
-  id?: string | number;
-  [key: string]: any;
-}
+<script setup>
+import { ref, onMounted } from "vue";
 const props = defineProps({
-  data: {
-    type: Array<Item>,
+  allItems: {
+    type: Array,
     default: () => [],
   },
   keyField: {
@@ -41,68 +34,74 @@ const props = defineProps({
     type: Number,
     default: 200,
   },
-  itemHeight: {
+  renderSize: {
     type: Number,
-    default: 40,
+    default: 15, // 每次渲染的 item 数量
   },
   buffer: {
     type: Number,
     default: 5,
   },
 });
-const scrollTop = ref(0);
-const scrollBottom = ref(0);
-const startIndex = ref(0);
-const visibleCount = computed(() =>
-  Math.ceil(props.AllHeight / props.itemHeight)
-);
-const endIndex = ref(0);
-const scrollContainer = ref<Element | null>(null);
-const paddingTop = computed(() => startIndex.value * props.itemHeight);
-const paddingBottom = computed(
-  () => (props.data.length - endIndex.value) * props.itemHeight
-);
-let ticking = false; // 用于 rAF 节流
-const onScroll = () => {
-  if (!ticking) {
-    window.requestAnimationFrame(() => {
-      scrollTop.value = scrollContainer.value?.scrollTop || 0;
-      startIndex.value = Math.floor(scrollTop.value / props.itemHeight);
-      endIndex.value = Math.min(
-        props.data.length,
-        startIndex.value + visibleCount.value + props.buffer
-      );
-      ticking = false;
-    });
-    ticking = true;
+const viewportRef = ref(null);
+const renderItems = ref([]); // 当前需要渲染的 item
+const hasRenderedItemsHeight = ref({}); // 已渲染的 item 数据 height
+const offset = ref(0);
+// 更新已渲染的 item 高度
+const updateRenderItems = () => {
+  const scrollTop = viewportRef.value?.scrollTop;
+
+  let startIndex = 0;
+  let startOffset = 0;
+
+  for (let i = 0; i < props.allItems.length; i++) {
+    const h = hasRenderedItemsHeight.value[props.allItems[i][props.keyField]];
+    startOffset += h;
+    if (startOffset >= scrollTop) {
+      startIndex = i;
+      break;
+    }
+  }
+
+  renderItems.value = props.allItems.slice(
+    startIndex,
+    startIndex + props.renderSize + props.buffer
+  );
+  offset.value =
+    startOffset - hasRenderedItemsHeight.value[props.allItems[startIndex][props.keyField]];
+};
+
+const renderItemsRef = (el, id) => {
+  if (el) {
+    // 存放已渲染的 item 的高度
+    hasRenderedItemsHeight.value[id] = el.offsetHeight;
   }
 };
-// key字段设置为动态，可以自定义
-const getKey = (item: DefaultItem, index: number) => {
-  return props.keyField ? item[props.keyField] : index;
+const handleScroll = () => {
+  updateRenderItems();
 };
-// 动态计算需要展示的item的数量
-const currentData = computed(() =>
-  props.data.slice(startIndex.value, endIndex.value)
-);
+
 onMounted(() => {
-  onScroll();
+  updateRenderItems();
 });
 </script>
 
-<style scoped lang="scss">
-.text-viral {
+<style>
+.viewport {
+  overflow-y: auto;
   position: relative;
-  width: 100%;
-  border: 1px solid #ccc;
-  border-radius: 10px;
+}
+.content-placeholder {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
 }
 
-.text-list-item {
-  box-sizing: border-box;
-  border-bottom: 1px solid #eee;
+.content-item {
+  border: 1px solid #000;
   display: flex;
+  justify-content: center;
   align-items: center;
-  padding: 0 8px;
 }
 </style>

@@ -1,30 +1,26 @@
 <template>
   <div
-    ref="scrollEl"
-    class="text-viral"
-    :style="{
-      height: AllHeight + 'px',
-      overflowY: 'auto',
-      position: 'relative',
-    }"
+    ref="containerRef"
+    class="virtual-list-container"
+    :style="{ height: AllHeight + 'px', overflowY: 'auto' }"
     @scroll.passive="onScroll"
   >
-    <!-- 用总高度撑起滚动条 -->
+    <!-- 整个内容高度，内部用绝对定位 -->
     <div :style="{ height: totalHeight + 'px', position: 'relative' }">
-      <!-- 仅渲染可见区；每项按累计偏移绝对定位 -->
       <div
-        v-for="(item, vIdx) in visibleItems"
-        :key="getKey(item, startIndex + vIdx)"
+        v-for="idx in visibleIndices"
+        :key="getKey(data[idx], idx)"
+        class="virtual-item"
+        :data-index="idx"
         :style="{
           position: 'absolute',
-          top: positions[startIndex + vIdx] + 'px',
+          top: offsets[idx] + 'px',
           left: 0,
           right: 0,
         }"
-        :ref="(el) => bindItemEl(el as HTMLElement | null, startIndex + vIdx)"
-        class="text-list-item"
+        :ref="(el) => setItemRef(el, idx)"
       >
-        <slot :item="item" :index="startIndex + vIdx"></slot>
+        <slot :item="data[idx]" :index="idx"></slot>
       </div>
     </div>
   </div>
@@ -32,244 +28,273 @@
 
 <script setup lang="ts">
 import {
-  computed,
   ref,
-  watch,
-  nextTick,
+  computed,
   onMounted,
   onBeforeUnmount,
-  withDefaults,
-  defineProps,
-  defineExpose,
+  nextTick,
+  watch,
 } from "vue";
+import type { PropType } from "vue";
 
-interface DefaultItem {
-  id?: string | number;
-  [k: string]: any;
+type DefaultItem = Record<string, any>;
+
+const props = defineProps({
+  data: { type: Array as PropType<DefaultItem[]>, default: () => [] },
+  keyField: { type: String, default: "id" },
+  AllHeight: { type: Number, default: 300 },
+  // 初始高度估值，尽量接近你列表里元素的平均高度
+  initialItemHeight: { type: Number, default: 50 },
+  buffer: { type: Number, default: 5 },
+});
+
+/* ---------------- state ---------------- */
+const containerRef = ref<HTMLElement | null>(null);
+
+const data = computed(() => props.data);
+const n = computed(() => data.value.length);
+
+// per-item heights (px). 未测量项保留估值
+const itemHeights = ref<number[]>([]);
+// offsets: prefix sum, offsets[0]=0; offsets[i] = sum heights[0..i-1]
+// offsets.length === n+1 (方便 totalHeight = offsets[n])
+const offsets = ref<number[]>([]);
+
+const totalHeight = computed(() => offsets.value[n.value] ?? 0);
+
+/* visible window */
+const scrollTop = ref(0);
+const startIndex = ref(0);
+const endIndex = ref(0);
+
+// list of indices to render
+const visibleIndices = computed(() => {
+  const res: number[] = [];
+  for (let i = startIndex.value; i < endIndex.value; i++) res.push(i);
+  return res;
+});
+
+/* DOM refs & observer */
+const itemElements = new Map<number, HTMLElement>(); // index -> el
+let ro: ResizeObserver | null = null;
+const observed = new Map<number, HTMLElement>(); // tracked by RO
+
+/* ---------------- helpers ---------------- */
+function getKey(item: DefaultItem, index: number) {
+  return props.keyField ? item?.[props.keyField] ?? index : index;
 }
 
-type Props = {
-  data: DefaultItem[];
-  keyField?: string;
-  AllHeight: number; // 视口高度
-  estimatedItemHeight?: number; // 未测量前的估算高度
-  buffer?: number; // 额外缓冲条目数
-  // 可选：无限滚动守卫
-  hasMore?: boolean;
-  loading?: boolean;
-  threshold?: number; // 距底多少像素触发 loadMore
-};
-
-const props = withDefaults(defineProps<Props>(), {
-  keyField: "id",
-  AllHeight: 300,
-  estimatedItemHeight: 48,
-  buffer: 6,
-  hasMore: false,
-  loading: false,
-  threshold: 200,
-});
-
-const emit = defineEmits<{ (e: "loadMore"): void }>();
-
-const scrollEl = ref<HTMLDivElement | null>(null);
-
-// —— 高度 & 累计偏移 —— //
-const heights = ref<number[]>([]); // index -> 实高（或估算）
-const positions = ref<number[]>([]); // index -> 顶部累计偏移
-const key2height = new Map<any, number>(); // key -> 最近一次实测高度缓存
-const totalHeight = ref(0);
-
-const getKey = (item: DefaultItem, index: number) =>
-  props.keyField && item?.[props.keyField] != null
-    ? item[props.keyField]
-    : index;
-
-// 确保容量并用估值/历史实测填充
-const ensureCapacity = () => {
-  const len = props.data.length;
-  const est = props.estimatedItemHeight!;
-  const next = new Array<number>(len);
-  for (let i = 0; i < len; i++) {
-    const k = getKey(props.data[i], i);
-    const known = key2height.get(k);
-    next[i] = known ?? heights.value[i] ?? est;
+function ensureInitHeights() {
+  // 如果数据长度改变，更新 itemHeights 长度并填充估值
+  const len = n.value;
+  if (itemHeights.value.length !== len) {
+    const old = itemHeights.value.slice(0, len);
+    const fill = new Array(Math.max(0, len - old.length)).fill(
+      props.initialItemHeight
+    );
+    itemHeights.value = old.concat(fill);
   }
-  heights.value = next;
-  recomputePositions();
-};
+  // build offsets
+  updateOffsets();
+}
 
-// O(n) 重算累计偏移 + 总高度
-const recomputePositions = () => {
-  const arr = heights.value;
-  positions.value.length = arr.length;
-  if (!arr.length) {
-    totalHeight.value = 0;
+function updateOffsets() {
+  const len = n.value;
+  const offs: number[] = new Array(len + 1);
+  let sum = 0;
+  offs[0] = 0;
+  for (let i = 0; i < len; i++) {
+    sum += itemHeights.value[i] ?? props.initialItemHeight;
+    offs[i + 1] = sum;
+  }
+  offsets.value = offs;
+}
+
+/** 二分查找：返回最大的 i 使 offsets[i] <= value */
+function findStartIndexByScrollTop(value: number) {
+  const offs = offsets.value;
+  let low = 0;
+  let high = Math.max(0, offs.length - 1);
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    if ((offs[mid] ?? 0) <= value) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return Math.max(0, low - 1);
+}
+
+/* 估算可视项数量（基于当前平均高度） */
+const averageHeight = computed(() => {
+  const arr = itemHeights.value;
+  if (!arr.length) return props.initialItemHeight;
+  const sum = arr.reduce((s, v) => s + (v ?? props.initialItemHeight), 0);
+  return Math.max(1, sum / arr.length);
+});
+function calcVisibleCount() {
+  return Math.ceil(props.AllHeight / averageHeight.value) + props.buffer;
+}
+
+/* ---------------- observers & refs ---------------- */
+function initResizeObserver() {
+  if (typeof ResizeObserver === "undefined") {
+    ro = null;
+    console.warn("ResizeObserver not available in this environment.");
     return;
   }
-  positions.value[0] = 0;
-  for (let i = 1; i < arr.length; i++) {
-    positions.value[i] = positions.value[i - 1] + arr[i - 1];
-  }
-  totalHeight.value = positions.value[arr.length - 1] + arr[arr.length - 1];
-};
-
-// —— 二分定位 startIndex —— //
-const findStartIndex = (scrollTop: number) => {
-  let lo = 0,
-    hi = positions.value.length - 1,
-    ans = 0;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    if (positions.value[mid] <= scrollTop) {
-      ans = mid;
-      lo = mid + 1;
-    } else hi = mid - 1;
-  }
-  return ans;
-};
-
-const startIndex = ref(0);
-// 根据真实高度向后覆盖到一屏，再追加 buffer
-const endIndex = computed(() => {
-  const len = props.data.length;
-  if (!len) return 0;
-  let i = startIndex.value;
-  let covered = 0;
-  const need = props.AllHeight;
-  while (i < len && covered < need) {
-    covered += heights.value[i] ?? props.estimatedItemHeight!;
-    i++;
-  }
-  return Math.min(len, i + props.buffer!);
-});
-
-const visibleItems = computed(() =>
-  props.data.slice(startIndex.value, endIndex.value)
-);
-
-// —— 单一的 rAF 节流滚动处理器 —— //
-let ticking = false;
-let suppressScroll = false; // 程序性滚动抑制标记
-let lastLoadTotal = 0; // 防重复 loadMore（同一总高度只触发一次）
-
-const maybeEmitLoadMore = (top: number) => {
-  if (!props.hasMore || props.loading) return;
-  const nearBottom =
-    top + props.AllHeight >= totalHeight.value - props.threshold!;
-  if (nearBottom && totalHeight.value !== lastLoadTotal) {
-    lastLoadTotal = totalHeight.value;
-    emit("loadMore");
-  }
-};
-
-const onScroll = () => {
-  if (suppressScroll) return;
-  if (ticking) return;
-  ticking = true;
-  requestAnimationFrame(() => {
-    const top = scrollEl.value?.scrollTop ?? 0;
-    startIndex.value = findStartIndex(top);
-    maybeEmitLoadMore(top);
-    ticking = false;
-  });
-};
-
-// —— 观察可见项高度（含宽度变化带来的换行） —— //
-const roMap = new Map<number, ResizeObserver>();
-const bindItemEl = (el: HTMLElement | null, index: number) => {
-  // 清理旧 observer（避免重复绑定）
-  roMap.get(index)?.disconnect();
-  roMap.delete(index);
-  if (!el) return;
-
-  const ro = new ResizeObserver((entries) => {
+  ro = new ResizeObserver((entries) => {
+    let needRecalc = false;
     for (const entry of entries) {
-      const h = Math.max(1, Math.round(entry.contentRect.height)); // 防 0
-      if (h !== heights.value[index]) {
-        // 锚点补偿：保持当前 startIndex 顶部在视口的位置不跳
-        const oldTop = positions.value[startIndex.value] ?? 0;
-
-        heights.value[index] = h;
-        const k = getKey(props.data[index], index);
-        key2height.set(k, h);
-        recomputePositions();
-
-        const newTop = positions.value[startIndex.value] ?? 0;
-        const delta = newTop - oldTop;
-        if (delta !== 0 && scrollEl.value) {
-          suppressScroll = true;
-          scrollEl.value.scrollTop += delta;
-          // 释放抑制（微任务，确保这次滚动事件被忽略）
-          queueMicrotask(() => {
-            suppressScroll = false;
-          });
-        }
+      const el = entry.target as HTMLElement;
+      const idxStr = el.dataset.index;
+      if (!idxStr) continue;
+      const idx = Number(idxStr);
+      const h = entry.contentRect.height;
+      if (itemHeights.value[idx] !== h) {
+        itemHeights.value[idx] = h;
+        needRecalc = true;
       }
     }
+    if (needRecalc) {
+      // 更新 offsets 与 totalHeight，并基于当前 scrollTop 调整 start/end
+      updateOffsets();
+      // 保证 startIndex 在正确位置（数据可能已移动）
+      startIndex.value = findStartIndexByScrollTop(scrollTop.value);
+      endIndex.value = Math.min(n.value, startIndex.value + calcVisibleCount());
+    }
   });
-  ro.observe(el);
-  roMap.set(index, ro);
-};
+}
 
-// —— 容器 ResizeObserver：浏览器宽度变化时，依赖 item 的 RO 自动重测 —— //
-let containerRO: ResizeObserver | null = null;
-onMounted(() => {
-  ensureCapacity();
-  // 初始化一次 startIndex
-  const top = scrollEl.value?.scrollTop ?? 0;
-  startIndex.value = findStartIndex(top);
+function setItemRef(el: HTMLElement | null, idx: number) {
+  if (el) {
+    el.dataset.index = String(idx);
+    itemElements.set(idx, el);
 
-  containerRO = new ResizeObserver(() => {
-    // 可见项高度变化会由各自的 RO 触发；这里补一次稳态重新定位
-    requestAnimationFrame(() => {
-      const t = scrollEl.value?.scrollTop ?? 0;
-      startIndex.value = findStartIndex(t);
+    // observe newly rendered element
+    if (ro && !observed.has(idx)) {
+      try {
+        ro.observe(el);
+        observed.set(idx, el);
+      } catch {}
+    }
+  } else {
+    // removed
+    itemElements.delete(idx);
+    const observedEl = observed.get(idx);
+    if (ro && observedEl) {
+      try {
+        ro.unobserve(observedEl);
+      } catch {}
+      observed.delete(idx);
+    }
+  }
+}
+
+/* 清理已不在可见区的 observed 元素（避免过多 observe）*/
+function syncObserved() {
+  if (!ro) return;
+  const visibleSet = new Set(visibleIndices.value);
+  for (const [idx, el] of Array.from(observed.entries())) {
+    if (!visibleSet.has(idx)) {
+      try {
+        ro.unobserve(el);
+      } catch {}
+      observed.delete(idx);
+    }
+  }
+  // observe current visible itemElements
+  for (const idx of visibleIndices.value) {
+    const el = itemElements.get(idx);
+    if (el && !observed.has(idx)) {
+      try {
+        ro.observe(el);
+        observed.set(idx, el);
+      } catch {}
+    }
+  }
+}
+
+/* ---------------- scroll & lifecycle ---------------- */
+let rafId: number | null = null;
+function onScroll() {
+  if (rafId != null) return;
+  rafId = requestAnimationFrame(() => {
+    rafId = null;
+    if (!containerRef.value) return;
+    scrollTop.value = containerRef.value.scrollTop;
+    startIndex.value = findStartIndexByScrollTop(scrollTop.value);
+    endIndex.value = Math.min(n.value, startIndex.value + calcVisibleCount());
+    // 渲染后同步 observe（nextTick）
+    nextTick(() => {
+      syncObserved();
     });
   });
-  if (scrollEl.value) containerRO.observe(scrollEl.value);
+}
+
+/* watch data changes to re-init arrays */
+watch(
+  () => data.value.length,
+  () => {
+    ensureInitHeights();
+    // recalc visible window
+    startIndex.value = findStartIndexByScrollTop(scrollTop.value);
+    endIndex.value = Math.min(n.value, startIndex.value + calcVisibleCount());
+    // after DOM updated, sync observed
+    nextTick(syncObserved);
+  },
+  { immediate: true }
+);
+
+onMounted(() => {
+  ensureInitHeights();
+  initResizeObserver();
+  // initial window
+  startIndex.value = 0;
+  endIndex.value = Math.min(n.value, calcVisibleCount());
+  nextTick(() => {
+    // observe/rendered elements
+    syncObserved();
+    // also measure any already-rendered item elements once (fallback if ResizeObserver not supported)
+    if (!ro) {
+      for (const [idx, el] of itemElements.entries()) {
+        const h = el.getBoundingClientRect().height;
+        if (itemHeights.value[idx] !== h) {
+          itemHeights.value[idx] = h;
+        }
+      }
+      updateOffsets();
+    }
+  });
 });
 
 onBeforeUnmount(() => {
-  containerRO?.disconnect();
-  roMap.forEach((ro) => ro.disconnect());
-  roMap.clear();
+  if (ro) {
+    try {
+      ro.disconnect();
+    } catch {}
+    ro = null;
+  }
+  itemElements.clear();
+  observed.clear();
+  if (rafId != null) {
+    cancelAnimationFrame(rafId);
+    rafId = null;
+  }
 });
-
-// 数据变化：复用 key 的历史实测高度，减少闪跳
-watch(
-  () => props.data,
-  async () => {
-    ensureCapacity();
-    await nextTick();
-    // 不强制触发滚动；由布局/RO 驱动
-  },
-  { deep: false }
-);
-
-// 暴露 API：滚动到指定索引
-const scrollToIndex = (index: number) => {
-  if (!scrollEl.value) return;
-  const top = positions.value[index] ?? 0;
-  suppressScroll = true;
-  scrollEl.value.scrollTop = top;
-  queueMicrotask(() => {
-    suppressScroll = false;
-  });
-};
-defineExpose({ scrollToIndex });
 </script>
 
-<style scoped lang="scss">
-.text-viral {
+<style scoped>
+.virtual-list-container {
   width: 100%;
-  border: 1px solid #ccc;
-  border-radius: 10px;
+  border: 1px solid #ddd;
+  box-sizing: border-box;
 }
-.text-list-item {
-  box-sizing: content-box;
+.virtual-item {
+  box-sizing: border-box;
   border-bottom: 1px solid #eee;
-  padding: 6px 8px;
-  display: block; /* 宽度变化触发 RO，高度可被观测到 */
+  padding: 8px;
+  background: white;
 }
 </style>
